@@ -1,0 +1,34 @@
+name: VEDA AI Multi-Engine Transcriber
+
+on:
+  workflow_dispatch: 
+
+jobs:
+  transcribe_job:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install System Dependencies (FFmpeg)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Install Python Packages
+        run: |
+          pip install requests huggingface_hub pydub
+
+      - name: Run Transcriber
+        env:
+          DEEPINFRA_KEY: ${{ secrets.DEEPINFRA_KEY }}
+          TELNYX_KEY: ${{ secrets.TELNYX_KEY }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: python audio_to_text.py
+
