@@ -1,0 +1,63 @@
+name: Correct Transcripts
+
+on:
+  workflow_dispatch:    
+  schedule:
+    - cron: '0 2 * * *'  
+
+jobs:
+  correct:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350   
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # FIX: Removed requirements.txt dependency for cache
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-cache-v1
+
+      - name: Install dependencies
+        run: pip install aiohttp huggingface_hub
+
+      - name: Restore progress
+        uses: actions/cache@v4
+        with:
+          path: |
+            progress.json
+            corrected/
+          key: correction-progress-${{ github.run_number }}
+          restore-keys: correction-progress-
+
+      - name: Run correction script
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          HF_TOKEN:       ${{ secrets.HF_TOKEN }}
+        run: python main.py
+
+      - name: Save progress
+        if: always()
+        uses: actions/cache@v4
+        with:
+          path: |
+            progress.json
+            corrected/
+          key: correction-progress-${{ github.run_number }}
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: correction-logs-${{ github.run_number }}
+          path: run_log.txt
+          retention-days: 7
+          
