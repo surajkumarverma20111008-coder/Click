@@ -4,7 +4,7 @@ import asyncio
 import aiohttp
 import time
 from pathlib import Path
-from huggingface_hub import snapshot_download, HfApi, hf_hub_download, list_repo_files
+from huggingface_hub import snapshot_download, HfApi
 
 # --- CONFIGURATION & SECRETS ---
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY") 
@@ -20,8 +20,8 @@ CONTINUITY_FILE = "Continuity_Checker.txt"
 
 LOCAL_DOWNLOAD_DIR = Path("./text_download")
 LOCAL_FINAL_DIR = Path("./text_clean_final")
-LOCAL_DOWNLOAD_DIR.mkdir(exist_ok=True)
-LOCAL_FINAL_DIR.mkdir(exist_ok=True)
+LOCAL_DOWNLOAD_DIR.mkdir(exist_ok=True, parents=True)
+LOCAL_FINAL_DIR.mkdir(exist_ok=True, parents=True)
 
 # 🔴 28 RPM TARGET (1 Request every 4.3s per model)
 DELAY_BETWEEN_CALLS = 4.3 
@@ -50,16 +50,14 @@ def is_safe_output(text):
     if not text or text.strip() == "": return False
     bad_words = ["Segment", "Professional Hindi", "Self-Correction", "Correct spelling"]
     if any(word.lower() in text.lower() for word in bad_words): return False
-    # If more than 50 English characters, AI hallucinated
     if len(re.findall(r'[a-zA-Z]', text)) > 50: return False
     return True
 
-# 🔴 SMART SPLITTING RULE (Words Based - Suraj's Logic)
+# 🔴 SMART SPLITTING RULE (Words Based)
 def split_merged_episodes(file_path, filename):
     with open(file_path, 'r', encoding='utf-8') as f: 
         content = f.read()
     
-    # 2000 Word Lock: अगर शब्द 2000 से कम हैं, तो फाइल नहीं कटेगी
     word_count = len(content.split())
     if word_count <= 2000 and "_to_" not in filename.lower():
         return [(filename, content)]
@@ -75,9 +73,8 @@ def split_merged_episodes(file_path, filename):
         if not text_part: continue
         
         current_chunk += " " + text_part
-        # कटिंग पॉइंट: सिर्फ वहीं से कटेगा जहाँ ये खास लाइनें होंगी
         if any(kw in text_part for kw in ["अगला भाग", "पॉकेट एफएम", "पॉकेट पर"]):
-            if len(current_chunk.split()) > 200: # Safety check
+            if len(current_chunk.split()) > 200: 
                 processed_chunks.append(current_chunk.strip())
                 current_chunk = ""
                 
@@ -87,13 +84,11 @@ def split_merged_episodes(file_path, filename):
     base_name = filename.replace(".txt", "").split("_to_")[0]
     split_files = []
     
-    # नामकरण (Naming): a, b, c लगाना
     if len(processed_chunks) > 1:
         for idx, text_block in enumerate(processed_chunks):
             suffix = chr(97 + idx) 
             split_files.append((f"{base_name}{suffix}.txt", text_block))
     else:
-        # अगर 2000 से ज्यादा शब्द हैं पर कोई एंडिंग लाइन नहीं मिली (सिंगल लॉन्ग एपिसोड)
         split_files.append((filename, content))
         
     return split_files
@@ -108,10 +103,12 @@ async def get_rate_limited_model(index):
         LAST_CALL_TIME[model_name] = time.monotonic()
     return model_name
 
-# 🛡️ LAYER 3: BULLETPROOF API CALL
+# 🛡️ LAYER 3: BULLETPROOF OFFICIAL API CALL
 async def call_gemma_api(session, text, index):
     model_name = await get_rate_limited_model(index)
-    url = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+    
+    # FIX: Using Official Native Google API Endpoint to avoid KeyError
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={GEMINI_API_KEY}"
     
     sys_instruct = (
         "तुम एक टेक्स्ट एडिटर हो। केवल स्पेलिंग सुधारो: "
@@ -120,15 +117,12 @@ async def call_gemma_api(session, text, index):
     )
     
     payload = {
-        "model": model_name,
-        "messages": [
-            {"role": "system", "content": sys_instruct},
-            {"role": "user", "content": text}
-        ],
-        "temperature": 0.05
+        "contents": [{"parts": [{"text": text}]}],
+        "systemInstruction": {"parts": [{"text": sys_instruct}]},
+        "generationConfig": {"temperature": 0.05, "maxOutputTokens": 4096}
     }
     
-    headers = {"Authorization": f"Bearer {GEMINI_API_KEY}", "Content-Type": "application/json"}
+    headers = {"Content-Type": "application/json"}
     
     for attempt in range(1, 4):
         try:
@@ -139,15 +133,15 @@ async def call_gemma_api(session, text, index):
                 resp.raise_for_status()
                 data = await resp.json()
                 
-                ai_text = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                # Official Safe JSON Parsing
+                ai_text = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
                 if ai_text: return ai_text, model_name
                 
-        except Exception:
+        except Exception as e:
             await asyncio.sleep(1.5 ** attempt)
             
     return None, model_name 
 
-# 🚀 TASK RUNNER — Ek file ko handle karne ka function
 async def handle_single_episode(filename, text_content, index, semaphore, session):
     output_path = LOCAL_FINAL_DIR / filename
     if output_path.exists(): 
@@ -156,12 +150,10 @@ async def handle_single_episode(filename, text_content, index, semaphore, sessio
     async with semaphore:
         fixed_text, used_model = await call_gemma_api(session, text_content, index)
         
-        # FINAL SAFETY CHECK
         if fixed_text and is_safe_output(fixed_text):
             final_text = fixed_text
             msg = f"✅ AI Success: {filename} ({used_model})"
         else:
-            # ZERO CRASH: Fallback to local dictionary
             final_text = offline_local_fix(text_content)
             msg = f"⚡ Fallback Success: {filename} (Offline Fix Applied)"
             
@@ -175,10 +167,21 @@ def extract_summary(text):
     if len(sentences) <= 8: return f"[SHORT]\n{text}\n"
     return f"[START] {'। '.join(sentences[:4])}।\n[END] {'। '.join(sentences[-4:])}।"
 
-# 🚀 MAIN — Async pipeline (Updated for PARALLEL BATCHING)
 async def main():
-    print("📥 1. Downloading Original Data...")
-    snapshot_download(repo_id=REPO_ID, repo_type="dataset", allow_patterns=f"{INPUT_FOLDER}/*.txt", local_dir=str(LOCAL_DOWNLOAD_DIR), token=HF_TOKEN)
+    print("📥 1. Downloading ONLY Text Files (No Audio)...")
+    try:
+        # FIX: Added allow_patterns to PREVENT downloading 20GB audio files and fixing 429 error!
+        snapshot_download(
+            repo_id=REPO_ID, 
+            repo_type="dataset", 
+            allow_patterns=[f"{INPUT_FOLDER}/*.txt"], 
+            ignore_patterns=["*.mp3", "*.wav", "*.m4a"],
+            local_dir=str(LOCAL_DOWNLOAD_DIR), 
+            token=HF_TOKEN
+        )
+    except Exception as e:
+        print(f"❌ HF Download Error: {e}")
+        return
     
     raw_folder = LOCAL_DOWNLOAD_DIR / INPUT_FOLDER
     raw_files = sorted([f for f in os.listdir(raw_folder) if f.endswith('.txt') and f != CONTINUITY_FILE], key=natural_sort_key)
@@ -189,23 +192,20 @@ async def main():
         
     print(f"🚀 2. Processing {len(final_pool)} files (Parallel Fast Mode)...")
     
-    semaphore = asyncio.Semaphore(30) 
+    semaphore = asyncio.Semaphore(20) 
     api = HfApi()
     
-    # TCP Connector limit badhayi taki parallel request me jam na lage
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=300), connector=aiohttp.TCPConnector(limit=30)) as session:
-        # 10 फाइलों का बैच एक साथ भेजेंगे ताकि मॉडल्स खाली न बैठें
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=300), connector=aiohttp.TCPConnector(limit=20)) as session:
         PARALLEL_BATCH = 10 
         
         for i in range(0, len(final_pool), PARALLEL_BATCH):
             batch = final_pool[i:i+PARALLEL_BATCH]
             print(f"\n▶️ Processing Files {i+1} to {min(i+PARALLEL_BATCH, len(final_pool))}...")
             
-            # Yahan saari files ek saath run hongi (Superfast Mode)
             tasks = [handle_single_episode(fn, content, i+j, semaphore, session) for j, (fn, content) in enumerate(batch)]
             await asyncio.gather(*tasks)
             
-            # Har 50 file ke baad Continuity Checker aur Upload
+            # Batch Upload Tracker
             if (i + PARALLEL_BATCH) % 50 == 0 or (i + PARALLEL_BATCH) >= len(final_pool):
                 checker_data = []
                 ready_files = sorted([f for f in os.listdir(LOCAL_FINAL_DIR) if f.endswith('.txt') and f != CONTINUITY_FILE], key=natural_sort_key)
@@ -217,14 +217,19 @@ async def main():
                     f.writelines(checker_data)
 
                 try:
+                    # FIX: upload_folder is much faster than uploading files one by one
                     api.upload_folder(
-                        folder_path=str(LOCAL_FINAL_DIR), path_in_repo=OUTPUT_FOLDER, repo_id=REPO_ID, repo_type="dataset", token=HF_TOKEN,
-                        commit_message=f"Auto-Fix (2000 Word Logic): Up to file {min(i+PARALLEL_BATCH, len(final_pool))}"
+                        folder_path=str(LOCAL_FINAL_DIR), 
+                        path_in_repo=OUTPUT_FOLDER, 
+                        repo_id=REPO_ID, 
+                        repo_type="dataset", 
+                        token=HF_TOKEN,
+                        commit_message=f"Auto-Fix (Final Fast Mode): Up to file {min(i+PARALLEL_BATCH, len(final_pool))}"
                     )
-                    print("☁️ Uploaded to Hugging Face successfully!")
+                    print("☁️ Batch Uploaded to Hugging Face successfully!")
                 except Exception as e: 
                     print(f"⚠️ Upload Error (will retry next batch): {e}")
 
 if __name__ == "__main__":
     asyncio.run(main())
-        
+            
