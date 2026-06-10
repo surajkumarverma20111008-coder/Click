@@ -1,235 +1,371 @@
+"""
+Mr. Lawaris - Transcript Correction Pipeline
+Uses Gemma 4 via Gemini API (2 models, 14 req/min each = 28 req/min total)
+- Downloads from HuggingFace
+- Splits large files by episode boundaries
+- Corrects ASR errors using context-aware Gemma 4
+- Uploads corrected files in batches of 50
+"""
+
 import os
 import re
-import asyncio
-import aiohttp
 import time
+import json
+import math
+import random
+import logging
 from pathlib import Path
-from huggingface_hub import snapshot_download, HfApi
+from typing import Optional
+from huggingface_hub import HfApi, hf_hub_download, list_repo_files
+import google.generativeai as genai
 
-# --- CONFIGURATION & SECRETS ---
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY") 
-HF_TOKEN = os.environ.get("HF_TOKEN")
+# ─── CONFIG ───────────────────────────────────────────────────────────────────
+HF_REPO_ID      = "Kumarverma11/PocketFM_Audio"
+HF_FOLDER       = "Generated_Transcripts"
+OUTPUT_FOLDER   = "Corrected_Transcripts"
+WORK_DIR        = Path("./work")
+CORRECTED_DIR   = Path("./corrected")
 
-if not GEMINI_API_KEY or not HF_TOKEN:
-    raise ValueError("❌ ERROR: API Keys missing hain! GitHub Secrets check karein.")
+# Two Gemma 4 models - each gets 14 RPM (safe under 15 limit)
+GEMMA_MODELS = [
+    "gemma-4-31b-it",
+    "gemma-4-26b-a4b-it",
+]
+RPM_PER_MODEL   = 14          # safe limit per model
+BATCH_UPLOAD    = 50          # HF commit every N files
+WORD_THRESHOLD  = 3000        # files > this need splitting
+SMALL_THRESHOLD = 2000        # files <= this = single episode
 
-REPO_ID = "Kumarverma11/PocketFM_Audio"
-INPUT_FOLDER = "Generated_Transcripts"   
-OUTPUT_FOLDER = "Generated_Transcripts"  
-CONTINUITY_FILE = "Continuity_Checker.txt"
+# ─── LOGGING ──────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler()]
+)
+log = logging.getLogger(__name__)
 
-LOCAL_DOWNLOAD_DIR = Path("./text_download")
-LOCAL_FINAL_DIR = Path("./text_clean_final")
-LOCAL_DOWNLOAD_DIR.mkdir(exist_ok=True, parents=True)
-LOCAL_FINAL_DIR.mkdir(exist_ok=True, parents=True)
+# ─── EPISODE BOUNDARY PATTERNS ────────────────────────────────────────────────
+BOUNDARY_PATTERNS = [
+    r"जानने के लिए सुनिए.*?(?:अगला एपिसोड|कहानी का अगला भाग|अगला भाग)[^\n]*",
+    r"(?:कहानी का|इस कहानी का) अगला भाग[^\n]*(?:पॉकेट एफएम|Pocket\s*FM)[^\n]*",
+    r"(?:सिर्फ|केवल) (?:पॉकेट एफएम|Pocket\s*FM) पर[^\n]*",
+    r"अभी सुनें[^\n]*(?:अगला भाग|अगला एपिसोड)[^\n]*",
+    r"(?:जवाब जानने के लिए|जानने के लिए)[^\n]*(?:सुनिए|सुनें)[^\n]*",
+    r"(?:क्या|कब|कैसे|कौन)[^\n]*\?[^\n]*(?:जानने के लिए|सुनिए|सुनें)[^\n]*",
+    r"(?:तकदीर|किस्मत|भगवान)[^\n]*(?:के लिए|सोच)[^\n]*(?:सुनिए|सुनें|जानिए)[^\n]*",
+]
+COMBINED_PATTERN = re.compile(
+    "|".join(f"({p})" for p in BOUNDARY_PATTERNS),
+    re.IGNORECASE | re.UNICODE
+)
 
-# 🔴 28 RPM TARGET (1 Request every 4.3s per model)
-DELAY_BETWEEN_CALLS = 4.3 
-LAST_CALL_TIME = {"gemma-4-31b-it": 0.0, "gemma-4-26b-a4b-it": 0.0}
-MODEL_LOCKS = {"gemma-4-31b-it": asyncio.Lock(), "gemma-4-26b-a4b-it": asyncio.Lock()}
+# ─── RATE LIMITER ─────────────────────────────────────────────────────────────
+class DualModelRateLimiter:
+    """Round-robin across 2 models, each capped at RPM_PER_MODEL calls/min."""
+    def __init__(self):
+        self.idx        = 0
+        self.timestamps = {m: [] for m in GEMMA_MODELS}
 
-def natural_sort_key(filename):
-    return [int(text) if text.isdigit() else text.lower() for text in re.split(r'(\d+)', filename)]
+    def get_model(self) -> str:
+        # Pick the model with most remaining quota this minute
+        now = time.time()
+        best = None
+        best_remaining = -1
+        for m in GEMMA_MODELS:
+            # Purge timestamps older than 60s
+            self.timestamps[m] = [t for t in self.timestamps[m] if now - t < 60]
+            remaining = RPM_PER_MODEL - len(self.timestamps[m])
+            if remaining > best_remaining:
+                best_remaining = remaining
+                best = m
+        return best, best_remaining
 
-# 🛡️ LAYER 1: OFFLINE BACKUP (Zero Crash Guarantee)
-def offline_local_fix(text):
-    text = re.sub(r'[॥\|]', '', text)
-    corrections = {
-        r'\bअबे\b': 'अभय', r'\bअब है\b': 'अभय', r'\bकि आंश\b': 'कियांश',
-        r'\bरी मदद\b': 'मेरी मदद', r'\bतुम री\b': 'तुम मेरी', r'\bवह री\b': 'मेरी',
-        r'\bवह री क्या\b': 'मेरी क्या', r'\bशांति 2\b': 'शांति दो', r'\bरे घर\b': 'मेरे घर',
-        r'\bरी खैर\b': 'मेरी खैर', r'\bरी बात\b': 'मेरी बात', r'\bसौरी\b': 'सॉरी',
-        r'\bऑबेरॉय\b': 'ओबेरॉय'
-    }
-    for pattern, replacement in corrections.items():
-        text = re.sub(pattern, replacement, text)
-    return re.sub(r'\s+', ' ', text).strip()
+    def call(self, fn, *args, **kwargs):
+        """Execute fn with rate-limiting. Retries on 429."""
+        max_retries = 5
+        for attempt in range(max_retries):
+            model, remaining = self.get_model()
+            if remaining <= 0:
+                # Both models exhausted - wait until oldest slot frees
+                all_ts = sorted([
+                    t for ts in self.timestamps.values() for t in ts
+                ])
+                wait = 61 - (time.time() - all_ts[0]) if all_ts else 5
+                log.info(f"Rate limit reached. Waiting {wait:.1f}s...")
+                time.sleep(max(wait, 1))
+                continue
+            try:
+                self.timestamps[model].append(time.time())
+                result = fn(model, *args, **kwargs)
+                return result
+            except Exception as e:
+                err = str(e).lower()
+                if "429" in err or "quota" in err or "rate" in err:
+                    wait = 60 + random.uniform(5, 15)
+                    log.warning(f"429 on {model}. Waiting {wait:.0f}s... (attempt {attempt+1})")
+                    # Remove the failed timestamp (didn't count)
+                    if self.timestamps[model]:
+                        self.timestamps[model].pop()
+                    time.sleep(wait)
+                else:
+                    raise
+        raise RuntimeError("Max retries exceeded on rate limiter")
 
-# 🛡️ LAYER 2: AI OUTPUT SAFETY CHECKER
-def is_safe_output(text):
-    if not text or text.strip() == "": return False
-    bad_words = ["Segment", "Professional Hindi", "Self-Correction", "Correct spelling"]
-    if any(word.lower() in text.lower() for word in bad_words): return False
-    if len(re.findall(r'[a-zA-Z]', text)) > 50: return False
-    return True
+# ─── WORD COUNT ───────────────────────────────────────────────────────────────
+def word_count(text: str) -> int:
+    return len(text.split())
 
-# 🔴 SMART SPLITTING RULE (Words Based)
-def split_merged_episodes(file_path, filename):
-    with open(file_path, 'r', encoding='utf-8') as f: 
-        content = f.read()
+# ─── EPISODE SPLITTER ─────────────────────────────────────────────────────────
+def find_boundaries(text: str) -> list[int]:
+    """Return list of character positions where episode boundaries occur."""
+    boundaries = []
+    for m in COMBINED_PATTERN.finditer(text):
+        boundaries.append(m.end())
+    return boundaries
+
+def split_episodes(text: str, base_name: str) -> list[tuple[str, str]]:
+    """
+    Split large transcript into episodes.
+    Returns list of (filename_suffix, episode_text).
+    e.g. [("111a", text1), ("111b", text2), ...]
+    """
+    boundaries = find_boundaries(text)
+    if not boundaries:
+        log.warning(f"No boundaries found in {base_name} - keeping as single file")
+        return [("", text)]
+
+    # Build segments
+    segments = []
+    prev = 0
+    for end in boundaries:
+        seg = text[prev:end].strip()
+        if seg:
+            segments.append(seg)
+        prev = end
+    # Remaining text after last boundary
+    tail = text[prev:].strip()
+    if tail and word_count(tail) > 200:
+        segments.append(tail)
+
+    if len(segments) <= 1:
+        return [("", text)]
+
+    # Label as a, b, c, ...
+    labels = []
+    for i in range(len(segments)):
+        suffix = chr(ord('a') + i) if i < 26 else f"_{i}"
+        labels.append(suffix)
     
-    word_count = len(content.split())
-    if word_count <= 2000 and "_to_" not in filename.lower():
-        return [(filename, content)]
-    
-    split_pattern = r"(जानने के लिए सुनिए कहानी का अगला भाग सिर्फ पॉकेट पर।|सिर्फ पॉकेट एफएम पर।|कहानी का अगला भाग सिर्फ पॉकेट|पॉकेट एफएम पर सुनिए)"
-    parts = re.split(split_pattern, content)
-    
-    processed_chunks = []
-    current_chunk = ""
-    
-    for i in range(len(parts)):
-        text_part = parts[i].strip()
-        if not text_part: continue
-        
-        current_chunk += " " + text_part
-        if any(kw in text_part for kw in ["अगला भाग", "पॉकेट एफएम", "पॉकेट पर"]):
-            if len(current_chunk.split()) > 200: 
-                processed_chunks.append(current_chunk.strip())
-                current_chunk = ""
-                
-    if current_chunk.strip(): 
-        processed_chunks.append(current_chunk.strip())
+    log.info(f"Split {base_name} into {len(segments)} episodes")
+    return list(zip(labels, segments))
 
-    base_name = filename.replace(".txt", "").split("_to_")[0]
-    split_files = []
-    
-    if len(processed_chunks) > 1:
-        for idx, text_block in enumerate(processed_chunks):
-            suffix = chr(97 + idx) 
-            split_files.append((f"{base_name}{suffix}.txt", text_block))
-    else:
-        split_files.append((filename, content))
-        
-    return split_files
+# ─── ASR CORRECTION PROMPT ────────────────────────────────────────────────────
+SYSTEM_PROMPT = """तुम एक Hindi ASR transcript correction expert हो।
 
-async def get_rate_limited_model(index):
-    model_name = "gemma-4-31b-it" if index % 2 == 0 else "gemma-4-26b-a4b-it"
-    async with MODEL_LOCKS[model_name]:
-        now = time.monotonic()
-        elapsed = now - LAST_CALL_TIME[model_name]
-        if elapsed < DELAY_BETWEEN_CALLS:
-            await asyncio.sleep(DELAY_BETWEEN_CALLS - elapsed)
-        LAST_CALL_TIME[model_name] = time.monotonic()
-    return model_name
+तुम्हारा काम:
+- केवल ASR (speech-to-text) errors सुधारना है
+- कहानी की content, plot, या dialogue नहीं बदलनी
+- नए sentences नहीं जोड़ने
+- केवल गलत पहचाने गए शब्दों को context के आधार पर सुधारना
 
-# 🛡️ LAYER 3: BULLETPROOF OFFICIAL API CALL
-async def call_gemma_api(session, text, index):
-    model_name = await get_rate_limited_model(index)
-    
-    # FIX: Using Official Native Google API Endpoint to avoid KeyError
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={GEMINI_API_KEY}"
-    
-    sys_instruct = (
-        "तुम एक टेक्स्ट एडिटर हो। केवल स्पेलिंग सुधारो: "
-        "'अबे/अब है'->'अभय', 'कि आंश'->'कियांश', 'री मदद/रे घर'->'मेरी मदद/मेरे घर'। श्लोक चिह्न (॥ या |) हटाओ। "
-        "चेतावनी: कोई स्पष्टीकरण, टिप्पणी या अंग्रेजी का शब्द आउटपुट में नहीं आना चाहिए।"
+Common ASR errors जो सुधारने हैं:
+- Character names: अबे→अभय, अभी-अभी→अभय, राज→Raj (context देखो)
+- Broken words: ब न ना→बनाना, क ह ना→कहना
+- Missing spaces या extra spaces
+- Punctuation fixes (sentences properly end करना)
+- Similar sounding words जो context में गलत हों
+
+Output में केवल corrected Hindi story text दो।
+कोई explanation, notes, या extra text नहीं।
+Original formatting और paragraph breaks preserve करो।"""
+
+def correction_prompt(episode_text: str) -> str:
+    return f"""यह एक Hindi audio drama (Mr. Lawaris) का episode transcript है।
+
+ASR errors सुधारो और corrected text वापस दो।
+
+TRANSCRIPT:
+{episode_text}"""
+
+# ─── GEMINI API CALL ──────────────────────────────────────────────────────────
+def call_gemini(model: str, text: str) -> str:
+    """Call Gemini API with given model and return corrected text."""
+    client = genai.GenerativeModel(
+        model_name=model,
+        system_instruction=SYSTEM_PROMPT,
     )
-    
-    payload = {
-        "contents": [{"parts": [{"text": text}]}],
-        "systemInstruction": {"parts": [{"text": sys_instruct}]},
-        "generationConfig": {"temperature": 0.05, "maxOutputTokens": 4096}
-    }
-    
-    headers = {"Content-Type": "application/json"}
-    
-    for attempt in range(1, 4):
-        try:
-            async with session.post(url, headers=headers, json=payload) as resp:
-                if resp.status in [429, 500, 503]:
-                    await asyncio.sleep(2.0 ** attempt)
-                    continue
-                resp.raise_for_status()
-                data = await resp.json()
-                
-                # Official Safe JSON Parsing
-                ai_text = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
-                if ai_text: return ai_text, model_name
-                
-        except Exception as e:
-            await asyncio.sleep(1.5 ** attempt)
-            
-    return None, model_name 
-
-async def handle_single_episode(filename, text_content, index, semaphore, session):
-    output_path = LOCAL_FINAL_DIR / filename
-    if output_path.exists(): 
-        return filename, True
-        
-    async with semaphore:
-        fixed_text, used_model = await call_gemma_api(session, text_content, index)
-        
-        if fixed_text and is_safe_output(fixed_text):
-            final_text = fixed_text
-            msg = f"✅ AI Success: {filename} ({used_model})"
-        else:
-            final_text = offline_local_fix(text_content)
-            msg = f"⚡ Fallback Success: {filename} (Offline Fix Applied)"
-            
-        with open(output_path, 'w', encoding='utf-8') as f:
-            f.write(final_text.strip())
-        print(msg)
-        return filename, True
-
-def extract_summary(text):
-    sentences = [s.strip() for s in re.split(r'[।\.!?]', text) if s.strip()]
-    if len(sentences) <= 8: return f"[SHORT]\n{text}\n"
-    return f"[START] {'। '.join(sentences[:4])}।\n[END] {'। '.join(sentences[-4:])}।"
-
-async def main():
-    print("📥 1. Downloading ONLY Text Files (No Audio)...")
-    try:
-        # FIX: Added allow_patterns to PREVENT downloading 20GB audio files and fixing 429 error!
-        snapshot_download(
-            repo_id=REPO_ID, 
-            repo_type="dataset", 
-            allow_patterns=[f"{INPUT_FOLDER}/*.txt"], 
-            ignore_patterns=["*.mp3", "*.wav", "*.m4a"],
-            local_dir=str(LOCAL_DOWNLOAD_DIR), 
-            token=HF_TOKEN
+    response = client.generate_content(
+        correction_prompt(text),
+        generation_config=genai.GenerationConfig(
+            temperature=0.1,    # Low temp for correction task
+            max_output_tokens=8192,
         )
-    except Exception as e:
-        print(f"❌ HF Download Error: {e}")
-        return
-    
-    raw_folder = LOCAL_DOWNLOAD_DIR / INPUT_FOLDER
-    raw_files = sorted([f for f in os.listdir(raw_folder) if f.endswith('.txt') and f != CONTINUITY_FILE], key=natural_sort_key)
-    
-    final_pool = [] 
-    for f in raw_files: 
-        final_pool.extend(split_merged_episodes(os.path.join(raw_folder, f), f))
-        
-    print(f"🚀 2. Processing {len(final_pool)} files (Parallel Fast Mode)...")
-    
-    semaphore = asyncio.Semaphore(20) 
-    api = HfApi()
-    
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=300), connector=aiohttp.TCPConnector(limit=20)) as session:
-        PARALLEL_BATCH = 10 
-        
-        for i in range(0, len(final_pool), PARALLEL_BATCH):
-            batch = final_pool[i:i+PARALLEL_BATCH]
-            print(f"\n▶️ Processing Files {i+1} to {min(i+PARALLEL_BATCH, len(final_pool))}...")
-            
-            tasks = [handle_single_episode(fn, content, i+j, semaphore, session) for j, (fn, content) in enumerate(batch)]
-            await asyncio.gather(*tasks)
-            
-            # Batch Upload Tracker
-            if (i + PARALLEL_BATCH) % 50 == 0 or (i + PARALLEL_BATCH) >= len(final_pool):
-                checker_data = []
-                ready_files = sorted([f for f in os.listdir(LOCAL_FINAL_DIR) if f.endswith('.txt') and f != CONTINUITY_FILE], key=natural_sort_key)
-                for f_name in ready_files:
-                    with open(LOCAL_FINAL_DIR / f_name, 'r', encoding='utf-8') as f:
-                        checker_data.append(f"\n{'='*40}\n🎬 {f_name}\n{'='*40}\n{extract_summary(f.read())}\n")
-                
-                with open(LOCAL_FINAL_DIR / CONTINUITY_FILE, 'w', encoding='utf-8') as f: 
-                    f.writelines(checker_data)
+    )
+    return response.text.strip()
 
-                try:
-                    # FIX: upload_folder is much faster than uploading files one by one
-                    api.upload_folder(
-                        folder_path=str(LOCAL_FINAL_DIR), 
-                        path_in_repo=OUTPUT_FOLDER, 
-                        repo_id=REPO_ID, 
-                        repo_type="dataset", 
-                        token=HF_TOKEN,
-                        commit_message=f"Auto-Fix (Final Fast Mode): Up to file {min(i+PARALLEL_BATCH, len(final_pool))}"
-                    )
-                    print("☁️ Batch Uploaded to Hugging Face successfully!")
-                except Exception as e: 
-                    print(f"⚠️ Upload Error (will retry next batch): {e}")
+# ─── PROCESS ONE FILE ─────────────────────────────────────────────────────────
+def process_file(
+    file_path: Path,
+    rate_limiter: DualModelRateLimiter,
+    output_dir: Path
+) -> list[Path]:
+    """
+    Process one transcript file.
+    Returns list of output file paths created.
+    """
+    text = file_path.read_text(encoding="utf-8")
+    stem = file_path.stem      # e.g. "episode_111"
+    suffix = file_path.suffix  # e.g. ".txt"
+    wc = word_count(text)
+    
+    log.info(f"Processing: {file_path.name} ({wc} words)")
+
+    # Decide: split or keep whole
+    if wc <= SMALL_THRESHOLD:
+        # Small file - single episode, correct as-is
+        episodes = [("", text)]
+        log.info(f"  → Single episode (≤{SMALL_THRESHOLD} words)")
+    elif wc <= WORD_THRESHOLD:
+        # Medium file - still process as-is (may be 1-2 episodes)
+        episodes = [("", text)]
+        log.info(f"  → Processing whole ({wc} words, under threshold)")
+    else:
+        # Large file - split by episode boundaries
+        log.info(f"  → Large file ({wc} words), detecting boundaries...")
+        episodes = split_episodes(text, stem)
+
+    output_paths = []
+    for label, ep_text in episodes:
+        ep_wc = word_count(ep_text)
+        if ep_wc < 100:
+            log.warning(f"  Skipping tiny segment ({ep_wc} words)")
+            continue
+
+        # Build output filename
+        if label:
+            out_name = f"{stem}{label}{suffix}"   # episode_111a.txt
+        else:
+            out_name = f"{stem}{suffix}"           # episode_111.txt
+        out_path = output_dir / out_name
+
+        if out_path.exists():
+            log.info(f"  Already done: {out_name} - skipping")
+            output_paths.append(out_path)
+            continue
+
+        log.info(f"  Correcting: {out_name} ({ep_wc} words)...")
+        
+        # Call Gemma via rate limiter
+        corrected = rate_limiter.call(call_gemini, ep_text)
+        
+        out_path.write_text(corrected, encoding="utf-8")
+        output_paths.append(out_path)
+        log.info(f"  ✓ Saved: {out_name}")
+
+    return output_paths
+
+# ─── HUGGINGFACE UPLOAD ───────────────────────────────────────────────────────
+def upload_batch(files: list[Path], hf_api: HfApi, batch_num: int):
+    """Upload a batch of corrected files to HuggingFace."""
+    if not files:
+        return
+    log.info(f"Uploading batch {batch_num} ({len(files)} files)...")
+    
+    # Build list of (local_path, repo_path) pairs
+    path_in_repo_list = []
+    local_paths = []
+    for f in files:
+        path_in_repo_list.append(f"{OUTPUT_FOLDER}/{f.name}")
+        local_paths.append(str(f))
+    
+    hf_api.upload_files(
+        repo_id=HF_REPO_ID,
+        repo_type="dataset",
+        path_or_fileobj=[open(p, "rb") for p in local_paths],
+        path_in_repo=path_in_repo_list,
+        commit_message=f"Add corrected transcripts - batch {batch_num} ({len(files)} files)",
+    )
+    log.info(f"✓ Batch {batch_num} uploaded successfully")
+
+# ─── MAIN ─────────────────────────────────────────────────────────────────────
+def main():
+    # Setup API
+    api_key = os.environ.get("GEMINI_API_KEY")
+    hf_token = os.environ.get("HF_TOKEN")
+    if not api_key:
+        raise ValueError("GEMINI_API_KEY not set")
+    if not hf_token:
+        raise ValueError("HF_TOKEN not set")
+    
+    genai.configure(api_key=api_key)
+    hf_api = HfApi(token=hf_token)
+    
+    WORK_DIR.mkdir(exist_ok=True)
+    CORRECTED_DIR.mkdir(exist_ok=True)
+    
+    # ── Step 1: List all transcript files from HuggingFace ──
+    log.info("Fetching file list from HuggingFace...")
+    all_files = list(list_repo_files(
+        HF_REPO_ID,
+        repo_type="dataset",
+        token=hf_token
+    ))
+    transcript_files = [
+        f for f in all_files
+        if f.startswith(HF_FOLDER + "/") and f.endswith(".txt")
+    ]
+    log.info(f"Found {len(transcript_files)} transcript files")
+    
+    # ── Step 2: Check which are already corrected ──
+    done_files = set(list(list_repo_files(
+        HF_REPO_ID, repo_type="dataset", token=hf_token
+    )))
+    
+    rate_limiter = DualModelRateLimiter()
+    pending_upload = []
+    batch_num = 1
+    
+    for i, hf_path in enumerate(sorted(transcript_files)):
+        filename = Path(hf_path).name
+        stem = Path(hf_path).stem
+        
+        # Check if already corrected (skip if found in output folder)
+        corrected_path_check = f"{OUTPUT_FOLDER}/{stem}.txt"
+        if corrected_path_check in done_files:
+            log.info(f"[{i+1}/{len(transcript_files)}] Already corrected: {filename}")
+            continue
+        
+        # Download file
+        local_path = WORK_DIR / filename
+        if not local_path.exists():
+            log.info(f"Downloading: {filename}")
+            hf_hub_download(
+                repo_id=HF_REPO_ID,
+                filename=hf_path,
+                repo_type="dataset",
+                local_dir=str(WORK_DIR),
+                token=hf_token,
+            )
+        
+        # Process (split if needed + correct)
+        try:
+            output_files = process_file(local_path, rate_limiter, CORRECTED_DIR)
+            pending_upload.extend(output_files)
+        except Exception as e:
+            log.error(f"Failed to process {filename}: {e}")
+            continue
+        
+        # Batch upload every 50 files
+        if len(pending_upload) >= BATCH_UPLOAD:
+            upload_batch(pending_upload[:BATCH_UPLOAD], hf_api, batch_num)
+            batch_num += 1
+            pending_upload = pending_upload[BATCH_UPLOAD:]
+    
+    # Upload remaining files
+    if pending_upload:
+        upload_batch(pending_upload, hf_api, batch_num)
+    
+    log.info("✅ Pipeline complete!")
 
 if __name__ == "__main__":
-    asyncio.run(main())
-            
+    main()
