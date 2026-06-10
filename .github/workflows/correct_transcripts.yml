@@ -1,63 +1,64 @@
-name: Correct Transcripts
+name: Mr. Lawaris - Transcript Correction Pipeline
 
 on:
-  workflow_dispatch:    
+  workflow_dispatch:          # Manual trigger from GitHub UI
   schedule:
-    - cron: '0 2 * * *'  
+    - cron: "0 2 * * *"       # Auto-run daily at 2 AM UTC
 
 jobs:
-  correct:
+  correct-transcripts:
     runs-on: ubuntu-latest
-    timeout-minutes: 350   
+    timeout-minutes: 350      # Just under GitHub's 6-hour limit
+
+    env:
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
 
     steps:
-      - name: Checkout repo
+      # ── 1. Checkout repo ──────────────────────────────────────────────────
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      # ── 2. Setup Python ───────────────────────────────────────────────────
+      - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
+          cache: "pip"
 
-      # FIX: Removed requirements.txt dependency for cache
-      - name: Cache pip
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: pip-cache-v1
-
+      # ── 3. Install dependencies ───────────────────────────────────────────
       - name: Install dependencies
-        run: pip install aiohttp huggingface_hub
+        run: |
+          pip install --upgrade pip
+          pip install \
+            google-generativeai>=0.8.0 \
+            huggingface_hub>=0.24.0 \
+            tqdm
 
-      - name: Restore progress
-        uses: actions/cache@v4
-        with:
-          path: |
-            progress.json
-            corrected/
-          key: correction-progress-${{ github.run_number }}
-          restore-keys: correction-progress-
+      # ── 4. Verify secrets are set ─────────────────────────────────────────
+      - name: Verify secrets
+        run: |
+          if [ -z "$GEMINI_API_KEY" ]; then
+            echo "❌ GEMINI_API_KEY is not set!"
+            exit 1
+          fi
+          if [ -z "$HF_TOKEN" ]; then
+            echo "❌ HF_TOKEN is not set!"
+            exit 1
+          fi
+          echo "✅ Both secrets are available"
 
-      - name: Run correction script
-        env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          HF_TOKEN:       ${{ secrets.HF_TOKEN }}
-        run: python main.py
+      # ── 5. Run correction pipeline ────────────────────────────────────────
+      - name: Run transcript correction pipeline
+        run: |
+          python main.py
 
-      - name: Save progress
+      # ── 6. Summary ────────────────────────────────────────────────────────
+      - name: Pipeline summary
         if: always()
-        uses: actions/cache@v4
-        with:
-          path: |
-            progress.json
-            corrected/
-          key: correction-progress-${{ github.run_number }}
-
-      - name: Upload logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: correction-logs-${{ github.run_number }}
-          path: run_log.txt
-          retention-days: 7
-          
+        run: |
+          echo "=== Pipeline Run Summary ==="
+          echo "Corrected files saved to: ./corrected/"
+          ls -la ./corrected/ 2>/dev/null | tail -20 || echo "No corrected dir found"
+          echo "Work dir files:"
+          ls ./work/ 2>/dev/null | wc -l || echo "0"
